@@ -3,6 +3,11 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const dotenv = require('dotenv');
+const Minio = require('minio');
+const multer = require('multer');
+const path = require('path');
+const swaggerUi = require('swagger-ui-express');
+const swaggerJsdoc = require('swagger-jsdoc');
 
 // Load environment variables from .env file
 dotenv.config();
@@ -12,6 +17,22 @@ const port = process.env.PORT || 9000;
 
 app.use(cors());
 app.use(express.json());
+
+// --- SWAGGER SETUP ---
+const swaggerOptions = {
+    definition: {
+        openapi: '3.0.0',
+        info: {
+            title: 'User API',
+            version: '1.0.0',
+            description: 'API docs for users and MinIO image upload'
+        },
+        servers: [{ url: `http://localhost:${port}` }]
+    },
+    apis: ['./user.js']
+};
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 // --- DATABASE CONNECTION ---
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/sengvengsorng';
@@ -23,6 +44,39 @@ mongoose.connect(MONGO_URI)
     // Exit process on connection failure
     process.exit(1); 
   });
+
+// --- MINIO CONFIGURATION (Docker mapped: 9005:9000, console 9001) ---
+const minioClient = new Minio.Client({
+    endPoint: process.env.MINIO_ENDPOINT || 'localhost',
+    port: parseInt(process.env.MINIO_PORT || '9005', 10),
+    useSSL: process.env.MINIO_USE_SSL === 'true' || false,
+    accessKey: process.env.MINIO_ACCESS_KEY || 'minioadmin',
+    secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin123'
+});
+
+const MINIO_BUCKET = process.env.MINIO_BUCKET_NAME || 'test';
+
+// Lightweight info log (no secrets)
+console.log('MinIO config:', {
+    endPoint: process.env.MINIO_ENDPOINT || 'localhost',
+    port: parseInt(process.env.MINIO_PORT || '9005', 10),
+    useSSL: process.env.MINIO_USE_SSL === 'true' || false,
+    bucket: MINIO_BUCKET
+});
+
+// --- MULTER (memory storage) ---
+const uploadStorage = multer.memoryStorage();
+const upload = multer({
+    storage: uploadStorage,
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+    fileFilter: (req, file, cb) => {
+        const allowed = /jpeg|jpg|png|gif|webp/;
+        const extOk = allowed.test(path.extname(file.originalname).toLowerCase());
+        const mimeOk = allowed.test(file.mimetype);
+        if (extOk && mimeOk) return cb(null, true);
+        return cb(new Error('Only image files are allowed (jpeg, jpg, png, gif, webp)'));
+    }
+});
 
 // --- MONGOOSE SCHEMA & MODEL DEFINITION ---
 
@@ -174,6 +228,75 @@ app.post('/api/users/register', async (req, res) => {
         
         console.error('Error during user registration:', error);
         res.status(500).json({ message: 'Server error during registration.' });
+    }
+});
+
+// --- IMAGE UPLOAD ENDPOINT (MinIO) ---
+/**
+ * @swagger
+ * /api/upload/image:
+ *   post:
+ *     summary: Upload an image to MinIO
+ *     tags: [Upload]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - image
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Image uploaded successfully
+ *       400:
+ *         description: No image file provided
+ *       500:
+ *         description: Error uploading image
+ */
+app.post('/api/upload/image', upload.single('image'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: 'No image file provided.' });
+        }
+
+        const ext = path.extname(req.file.originalname).toLowerCase();
+        const fileName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+        const objectName = `uploads/${fileName}`;
+
+        await minioClient.putObject(
+            MINIO_BUCKET,
+            objectName,
+            req.file.buffer,
+            req.file.size,
+            { 'Content-Type': req.file.mimetype }
+        );
+
+        const protocol = process.env.MINIO_USE_SSL === 'true' ? 'https' : 'http';
+        const host = process.env.MINIO_ENDPOINT || 'localhost';
+        const port = parseInt(process.env.MINIO_PORT || '9005', 10);
+        const publicBase = process.env.MINIO_PUBLIC_URL;
+        const directUrl = publicBase
+            ? `${publicBase}/${MINIO_BUCKET}/${objectName}`
+            : `${protocol}://${host}:${port}/${MINIO_BUCKET}/${objectName}`;
+
+        // Generate a presigned URL (default: 7 days) to bypass AccessDenied without making bucket public
+        const expirySeconds = parseInt(process.env.MINIO_PRESIGNED_EXPIRY || '604800', 10); // 7 days
+        const presignedUrl = await minioClient.presignedGetObject(MINIO_BUCKET, objectName, expirySeconds);
+
+        return res.status(200).json({
+            message: 'Image uploaded successfully.',
+            imageUrl: presignedUrl,
+            directUrl,
+            fileName: objectName
+        });
+    } catch (error) {
+        console.error('Error uploading image:', error);
+        return res.status(500).json({ message: 'Error uploading image.', error: error.message });
     }
 });
 
