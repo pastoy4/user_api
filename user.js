@@ -18,18 +18,20 @@ const port = process.env.PORT || 9000;
 app.use(cors());
 app.use(express.json());
 
+ 
+
 // --- SWAGGER SETUP ---
 const swaggerOptions = {
-    definition: {
-        openapi: '3.0.0',
-        info: {
-            title: 'User API',
-            version: '1.0.0',
-            description: 'API docs for users and MinIO image upload'
-        },
-        servers: [{ url: `http://localhost:${port}` }]
-    },
-    apis: ['./user.js']
+	definition: {
+		openapi: '3.0.0',
+		info: {
+			title: 'User API',
+			version: '1.0.0',
+			description: 'API docs for users and MinIO image upload'
+		},
+		servers: [{ url: `http://localhost:${port}` }]
+	},
+	apis: ['./user.js']
 };
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -140,12 +142,30 @@ const User = mongoose.model('user', userSchema);
 
 // --- API ROUTES ---
 
-// Default route for testing server status
+/**
+ * @swagger
+ * /:
+ *   get:
+ *     summary: Welcome message
+ *     tags: [General]
+ *     responses:
+ *       200:
+ *         description: Welcome message
+ */
 app.get('/', (req, res) => {
     res.send('Welcome to the User API! Use /api/users/register for POST requests.');
 });
 
-// GET all users (For testing purposes)
+/**
+ * @swagger
+ * /api/users:
+ *   get:
+ *     summary: Get all users
+ *     tags: [Users]
+ *     responses:
+ *       200:
+ *         description: List of all users
+ */
 app.get('/api/users', async (req, res) => {
     try {
         const users = await User.find().select('-password -__v'); // Exclude sensitive/unnecessary fields
@@ -157,7 +177,34 @@ app.get('/api/users', async (req, res) => {
 });
 
 
-// POST route to register a new user
+/**
+ * @swagger
+ * /api/users/register:
+ *   post:
+ *     summary: Register a new user
+ *     tags: [Users]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [firstName, lastName, userName, image, dob, gender, email, password, confirmPassword, roleName]
+ *             properties:
+ *               firstName: { type: string }
+ *               lastName: { type: string }
+ *               userName: { type: string }
+ *               image: { type: string }
+ *               dob: { type: string, format: date }
+ *               gender: { type: string }
+ *               email: { type: string, format: email }
+ *               password: { type: string }
+ *               confirmPassword: { type: string }
+ *               roleName: { type: string }
+ *     responses:
+ *       201:
+ *         description: Created
+ */
 app.post('/api/users/register', async (req, res) => {
     // 1. Destructure data from the request body
     const { 
@@ -298,6 +345,74 @@ app.post('/api/upload/image', upload.single('image'), async (req, res) => {
         console.error('Error uploading image:', error);
         return res.status(500).json({ message: 'Error uploading image.', error: error.message });
     }
+});
+
+/**
+ * @swagger
+ * /minio/info:
+ *   get:
+ *     summary: MinIO configuration info (non-sensitive)
+ *     tags: [MinIO]
+ *     responses:
+ *       200:
+ *         description: Current MinIO config
+ */
+app.get('/minio/info', (req, res) => {
+	res.status(200).json({
+		endPoint: process.env.MINIO_ENDPOINT || 'localhost',
+		port: parseInt(process.env.MINIO_PORT || '9005', 10),
+		useSSL: process.env.MINIO_USE_SSL === 'true' || false,
+		bucket: MINIO_BUCKET
+	});
+});
+
+/**
+ * @swagger
+ * /minio/check:
+ *   get:
+ *     summary: Connectivity check to MinIO
+ *     tags: [MinIO]
+ *     responses:
+ *       200:
+ *         description: OK
+ *       500:
+ *         description: Not OK
+ */
+app.get('/minio/check', async (req, res) => {
+	try {
+		const buckets = await minioClient.listBuckets();
+		res.status(200).json({ ok: true, buckets: buckets.map(b => b.name) });
+	} catch (error) {
+		res.status(500).json({ ok: false, message: error.message, code: error.code });
+	}
+});
+
+/**
+ * @swagger
+ * /minio/setup:
+ *   post:
+ *     summary: Ensure MinIO bucket exists (idempotent)
+ *     tags: [MinIO]
+ *     responses:
+ *       200:
+ *         description: Bucket exists
+ *       201:
+ *         description: Bucket created
+ *       500:
+ *         description: Error
+ */
+app.post('/minio/setup', async (req, res) => {
+	try {
+		const exists = await minioClient.bucketExists(MINIO_BUCKET);
+		if (!exists) {
+			await minioClient.makeBucket(MINIO_BUCKET);
+			return res.status(201).json({ message: `Bucket '${MINIO_BUCKET}' created.` });
+		}
+		res.status(200).json({ message: `Bucket '${MINIO_BUCKET}' already exists.` });
+	} catch (error) {
+		console.error('Bucket setup error:', error);
+		res.status(500).json({ message: 'Bucket setup failed.', error: error.message });
+	}
 });
 
 
