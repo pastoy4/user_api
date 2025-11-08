@@ -2,7 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const app = express();
-const PORT = 4000;
+const PORT = 5000;
 
 app.use(express.json());
 app.use(cors());
@@ -23,7 +23,7 @@ const schemaCategory = new mongoose.Schema({
     created_date: { type: Date, default: Date.now }
 });
 
-const Category = mongoose.model("categorysv1112", schemaCategory);
+const Category = mongoose.model("Categories", schemaCategory);
 
 // =======================================================
 // CATEGORY CRUD ENDPOINTS
