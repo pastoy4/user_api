@@ -139,6 +139,64 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model('user', userSchema);
 
+// --- HELPER FUNCTION: Generate presigned URL for image ---
+async function getPresignedImageUrl(imageUrl) {
+    if (!imageUrl) return imageUrl;
+
+    try {
+        // If it's already a presigned URL (with query params), return as is
+        if (imageUrl.includes('?') && (imageUrl.includes('X-Amz') || imageUrl.includes('signature'))) {
+            return imageUrl;
+        }
+
+        let objectName = null;
+
+        // Handle MinIO console URL: http://localhost:9001/browser/<bucket>/<object>
+        const consoleMatch = imageUrl.match(/\/browser\/[^\/]+\/(.+)$/);
+        if (consoleMatch) {
+            objectName = decodeURIComponent(consoleMatch[1]);
+        }
+        // Handle direct URL: http://host:port/<bucket>/<object>
+        else if (imageUrl.includes(`/${MINIO_BUCKET}/`)) {
+            const parts = imageUrl.split(`/${MINIO_BUCKET}/`);
+            if (parts.length > 1) {
+                objectName = decodeURIComponent(parts[1].split('?')[0]);
+            }
+        }
+        // Handle object path already stored (e.g. uploads/filename.png)
+        else if (!imageUrl.startsWith('http')) {
+            objectName = imageUrl;
+        }
+
+        if (objectName) {
+            const expirySeconds = parseInt(process.env.MINIO_PRESIGNED_EXPIRY || '604800', 10); // 7 days
+            return await minioClient.presignedGetObject(MINIO_BUCKET, objectName, expirySeconds);
+        }
+
+        return imageUrl;
+    } catch (error) {
+        console.error('Error generating presigned URL:', error);
+        return imageUrl;
+    }
+}
+
+async function addPresignedImageUrls(userData) {
+    if (Array.isArray(userData)) {
+        return Promise.all(userData.map(async (user) => {
+            if (user.image) {
+                user.image = await getPresignedImageUrl(user.image);
+            }
+            return user;
+        }));
+    }
+
+    if (userData && userData.image) {
+        userData.image = await getPresignedImageUrl(userData.image);
+    }
+
+    return userData;
+}
+
 
 // --- API ROUTES ---
 
@@ -168,8 +226,9 @@ app.get('/', (req, res) => {
  */
 app.get('/api/users', async (req, res) => {
     try {
-        const users = await User.find().select('-password -__v'); // Exclude sensitive/unnecessary fields
-        res.status(200).json(users);
+        const users = await User.find().select('-password -__v').lean();
+        const usersWithPresignedUrls = await addPresignedImageUrls(users);
+        res.status(200).json(usersWithPresignedUrls);
     } catch (error) {
         console.error('Error fetching users:', error);
         res.status(500).json({ message: 'Internal Server Error' });
@@ -256,14 +315,25 @@ app.post('/api/users/register', async (req, res) => {
         // 6. Save the user to the database
         const savedUser = await newUser.save();
 
-        // 7. Send a successful response (excluding the password hash)
+        const userResponse = {
+            id: savedUser._id,
+            firstName: savedUser.firstName,
+            lastName: savedUser.lastName,
+            userName: savedUser.userName,
+            email: savedUser.email,
+            image: savedUser.image,
+            dob: savedUser.dob,
+            gender: savedUser.gender,
+            roleName: savedUser.roleName,
+            createdAt: savedUser.createdAt,
+            updatedAt: savedUser.updatedAt
+        };
+
+        const userWithPresignedUrl = await addPresignedImageUrls(userResponse);
+
         res.status(201).json({
             message: 'User registered successfully!',
-            user: {
-                id: savedUser._id,
-                userName: savedUser.userName,
-                email: savedUser.email
-            }
+            user: userWithPresignedUrl
         });
 
     } catch (error) {
@@ -275,6 +345,240 @@ app.post('/api/users/register', async (req, res) => {
         
         console.error('Error during user registration:', error);
         res.status(500).json({ message: 'Server error during registration.' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/users/login:
+ *   post:
+ *     summary: Login a user
+ *     tags: [Users]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [password]
+ *             properties:
+ *               email: { type: string, format: email }
+ *               userName: { type: string, description: "Username can be used instead of email" }
+ *               password: { type: string }
+ *             oneOf:
+ *               - required: [email, password]
+ *               - required: [userName, password]
+ *     responses:
+ *       200:
+ *         description: Login successful
+ *       400:
+ *         description: Missing credentials
+ *       401:
+ *         description: Invalid credentials
+ */
+app.post('/api/users/login', async (req, res) => {
+    const { email, userName, password } = req.body;
+
+    // Basic validation
+    if (!password || (!email && !userName)) {
+        return res.status(400).json({ message: 'Provide email or username along with password.' });
+    }
+
+    try {
+        // Build query based on provided identifier
+        const query = email
+            ? { email: email.toLowerCase().trim() }
+            : { userName: (userName || '').trim() };
+
+        const user = await User.findOne(query);
+
+        if (!user) {
+            return res.status(401).json({ message: 'Invalid credentials.' });
+        }
+
+        // Compare password with hashed password
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+
+        if (!isPasswordValid) {
+            return res.status(401).json({ message: 'Invalid credentials.' });
+        }
+
+        // Return user data (excluding password)
+        const userResponse = {
+            id: user._id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            userName: user.userName,
+            email: user.email,
+            image: user.image,
+            dob: user.dob,
+            gender: user.gender,
+            roleName: user.roleName,
+            createdAt: user.createdAt,
+            updatedAt: user.updatedAt
+        };
+
+        const userWithPresignedUrl = await addPresignedImageUrls(userResponse);
+
+        res.status(200).json({
+            message: 'Login successful!',
+            user: userWithPresignedUrl
+        });
+
+    } catch (error) {
+        console.error('Error during login:', error);
+        res.status(500).json({ message: 'Server error during login.' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/users/{id}:
+ *   get:
+ *     summary: Get user by ID
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: User found
+ *       404:
+ *         description: User not found
+ */
+app.get('/api/users/:id', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id).select('-password -__v').lean();
+        
+        if (!user) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+        
+        const userWithPresignedUrl = await addPresignedImageUrls(user);
+        res.status(200).json(userWithPresignedUrl);
+    } catch (error) {
+        console.error('Error fetching user:', error);
+        if (error.name === 'CastError') {
+            return res.status(400).json({ message: 'Invalid user ID format.' });
+        }
+        res.status(500).json({ message: 'Internal Server Error' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/users/{id}:
+ *   put:
+ *     summary: Update user by ID
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               firstName: { type: string }
+ *               lastName: { type: string }
+ *               userName: { type: string }
+ *               image: { type: string }
+ *               dob: { type: string, format: date }
+ *               gender: { type: string }
+ *               email: { type: string, format: email }
+ *               roleName: { type: string }
+ *     responses:
+ *       200:
+ *         description: User updated successfully
+ *       404:
+ *         description: User not found
+ */
+app.put('/api/users/:id', async (req, res) => {
+    try {
+        const { password, confirmPassword, ...updateData } = req.body;
+
+        // If password is being updated, hash it
+        if (password) {
+            if (password !== confirmPassword) {
+                return res.status(400).json({ message: 'Password and Confirm Password do not match.' });
+            }
+            const salt = await bcrypt.genSalt(10);
+            updateData.password = await bcrypt.hash(password, salt);
+        }
+
+        const updatedUser = await User.findByIdAndUpdate(
+            req.params.id,
+            updateData,
+            { new: true, runValidators: true }
+        ).select('-password -__v');
+
+        if (!updatedUser) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        const userWithPresignedUrl = await addPresignedImageUrls(updatedUser.toObject());
+        res.status(200).json({
+            message: 'User updated successfully.',
+            user: userWithPresignedUrl
+        });
+    } catch (error) {
+        console.error('Error updating user:', error);
+        if (error.name === 'ValidationError') {
+            const messages = Object.values(error.errors).map(val => val.message);
+            return res.status(400).json({ message: messages.join(', ') });
+        }
+        if (error.name === 'CastError') {
+            return res.status(400).json({ message: 'Invalid user ID format.' });
+        }
+        res.status(500).json({ message: 'Server error during update.' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/users/{id}:
+ *   delete:
+ *     summary: Delete user by ID
+ *     tags: [Users]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: User deleted successfully
+ *       404:
+ *         description: User not found
+ */
+app.delete('/api/users/:id', async (req, res) => {
+    try {
+        const deletedUser = await User.findByIdAndDelete(req.params.id).select('-password -__v');
+
+        if (!deletedUser) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        const userWithPresignedUrl = await addPresignedImageUrls(deletedUser.toObject());
+        res.status(200).json({
+            message: 'User deleted successfully.',
+            user: userWithPresignedUrl
+        });
+    } catch (error) {
+        console.error('Error deleting user:', error);
+        if (error.name === 'CastError') {
+            return res.status(400).json({ message: 'Invalid user ID format.' });
+        }
+        res.status(500).json({ message: 'Server error during deletion.' });
     }
 });
 
